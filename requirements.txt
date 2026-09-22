@@ -5,5 +5,5 @@ yt-dlp-ejs>=0.8.0
 pytubefix>=11.1.0
 python-dotenv>=1.1.1
 python-multipart>=0.0.20
-curl-cffi>=0.10.0
+curl-cffi>=0.7.0,<0.8.0
 

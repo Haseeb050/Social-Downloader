@@ -16,7 +16,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Social Media Video Downloader",
-    description="Local downloader for YouTube, Instagram, and TikTok (yt-dlp, no Apify).",
+    description="Local downloader for YouTube, Instagram, TikTok, X (Twitter), and Facebook (yt-dlp).",
 )
 
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
@@ -78,8 +78,12 @@ def _platform(url: str) -> str | None:
         return "youtube"
     if host in {"instagram.com", "instagr.am"} or host.endswith(".instagram.com"):
         return "instagram"
-    if host in {"tiktok.com"} or host.endswith(".tiktok.com"):
+    if host in {"tiktok.com", "vm.tiktok.com", "vt.tiktok.com"} or host.endswith(".tiktok.com"):
         return "tiktok"
+    if host in {"twitter.com", "x.com", "t.co"} or host.endswith(".twitter.com") or host.endswith(".x.com"):
+        return "twitter"
+    if host in {"facebook.com", "fb.watch", "fb.com", "m.facebook.com", "web.facebook.com"} or host.endswith(".facebook.com"):
+        return "facebook"
     return None
 
 
@@ -98,6 +102,9 @@ def _normalize_url(url: str, platform: str) -> str:
         video_id = (parse_qs(parsed.query).get("v") or [None])[0]
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id}"
+    if platform == "twitter":
+        clean_path = parsed.path.rstrip("/")
+        return f"https://x.com{clean_path}"
     return url
 
 
@@ -140,12 +147,14 @@ def _cleanup(path: str | None) -> None:
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
     if "unavailable" in text or "private" in text or "does not exist" in text:
-        return "This video is unavailable, deleted, or private on YouTube."
+        return f"This video is unavailable, deleted, or private on {platform.capitalize()}."
     if "sign in" in text or "not a bot" in text or "429" in text:
-        return "YouTube rate-limited or blocked this request. Try again shortly or update cookies."
+        return f"{platform.capitalize()} rate-limited or blocked this request. Try again shortly."
     if "empty media" in text or "login" in text or "cookies" in text:
         if platform == "instagram":
             return "Instagram video unavailable. Ensure the post is public."
+        if platform == "facebook":
+            return "Facebook video unavailable. Ensure the post/reel is public."
         return "This video requires authentication."
     if "ffmpeg" in text:
         return "ffmpeg is required to process this video."
@@ -160,6 +169,8 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
         "youtube": "https://www.youtube.com/",
         "instagram": "https://www.instagram.com/",
         "tiktok": "https://www.tiktok.com/",
+        "twitter": "https://x.com/",
+        "facebook": "https://www.facebook.com/",
     }
     opts = {
         "format": ydl_format,
@@ -281,7 +292,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
     if not platform:
         raise HTTPException(
             status_code=400,
-            detail="Only YouTube, Instagram, and TikTok URLs are supported.",
+            detail="Only YouTube, Instagram, TikTok, X (Twitter), and Facebook URLs are supported.",
         )
 
     url = _normalize_url(url, platform)
@@ -355,10 +366,10 @@ HOME_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Social Video Downloader</h1>
-  <p class="hint">YouTube, Instagram, and TikTok. Download can take 30–90 seconds.</p>
+  <p class="hint">Supported: YouTube, Instagram, TikTok, X (Twitter), Facebook.</p>
   <form action="/download" method="get">
     <label for="url">Video URL</label>
-    <input id="url" name="url" type="url" required placeholder="https://www.youtube.com/watch?v=..." />
+    <input id="url" name="url" type="url" required placeholder="https://x.com/... or https://www.tiktok.com/@... or https://www.facebook.com/..." />
     <label for="format">Quality</label>
     <select id="format" name="format">
       <option value="best" selected>Best</option>
@@ -384,7 +395,7 @@ async def root():
 async def health():
     return {
         "ok": True,
-        "platforms": ["youtube", "instagram", "tiktok"],
+        "platforms": ["youtube", "instagram", "tiktok", "twitter", "facebook"],
         "backend": "yt-dlp",
         "docs": "/docs",
     }

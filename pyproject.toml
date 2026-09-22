@@ -5,7 +5,7 @@ description = "A FastAPI backend using yt-dlp to download and stream videos from
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "curl-cffi>=0.10.0",
+    "curl-cffi>=0.7.0,<0.8.0",
     "fastapi>=0.116.1",
     "python-dotenv>=1.1.1",
     "python-multipart>=0.0.20",
