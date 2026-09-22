@@ -22,8 +22,20 @@ app = FastAPI(
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN") or "http://127.0.0.1:8000"
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 COOKIES_FROM_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "").strip().lower()
+
+def _get_cookie_file() -> str | None:
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        return COOKIES_FILE
+    for candidate in ["www.youtube.com_cookies.txt", "cookies.txt", "youtube_cookies.txt"]:
+        path = os.path.join(BASE_DIR, candidate)
+        if os.path.isfile(path):
+            return path
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 QUALITY_HEIGHT = {
     "1080": 1080,
@@ -164,12 +176,16 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
             ),
             "Referer": referers.get(platform, "https://www.google.com/"),
         },
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "web", "tv"]},
+        "js_runtimes": {
+            "node": {},
+            "deno": {},
+            "bun": {},
+            "quickjs": {},
         },
     }
-    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    cookie_file = _get_cookie_file()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
     elif COOKIES_FROM_BROWSER:
         opts["cookiesfrombrowser"] = (COOKIES_FROM_BROWSER,)
     return opts
