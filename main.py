@@ -136,11 +136,11 @@ def _cleanup(path: str | None) -> None:
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
     if "sign in" in text or "not a bot" in text:
-        return "YouTube blocked this request. Set COOKIES_FROM_BROWSER=chrome in .env (Chrome mein YouTube login hona chahiye)."
+        return "YouTube blocked this cloud request (Bot Detection). Server par 'www.youtube.com_cookies.txt' update karein ya local par COOKIES_FROM_BROWSER=chrome set karein."
     if "empty media" in text or "login" in text or "cookies" in text:
         if platform == "instagram":
-            return "Instagram ne video nahi di. Public reel ho, ya COOKIES_FROM_BROWSER=chrome set karein (Chrome mein Instagram login)."
-        return "This video needs login cookies. Set COOKIES_FROM_BROWSER=chrome in .env."
+            return "Instagram ne video nahi di. Public reel ho, ya cookies file provide karein."
+        return "This video needs login cookies. Provide cookies.txt on server or set COOKIES_FROM_BROWSER=chrome locally."
     if "private" in text:
         return "This video is private or unavailable."
     if "ffmpeg" in text:
@@ -183,6 +183,12 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
             "quickjs": {},
         },
     }
+    if platform == "youtube":
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            }
+        }
     cookie_file = _get_cookie_file()
     if cookie_file:
         opts["cookiefile"] = cookie_file
