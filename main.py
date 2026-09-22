@@ -109,10 +109,10 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best/b",
+            f"best[height<={height}]/bestvideo[height<={height}]+bestaudio/best",
             False,
         )
-    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best/b", False
+    return "best/bestvideo+bestaudio/b", False
 
 
 def _safe_filename(title: str, ext: str) -> str:
@@ -179,18 +179,9 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
             "Referer": referers.get(platform, "https://www.google.com/"),
         },
         "js_runtimes": {
-            "node": {},
-            "deno": {},
-            "bun": {},
-            "quickjs": {},
+            "node": {"path": "node"},
         },
     }
-    if platform == "youtube":
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["ios", "mweb", "web"],
-            }
-        }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     cookie_file = _get_cookie_file()
@@ -202,7 +193,7 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
 
 
 def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: str) -> tuple[str, str, str]:
-    """Secondary fallback engine using pytubefix for YouTube when yt-dlp encounters bot protection."""
+    """Secondary fallback engine using pytubefix for YouTube when yt-dlp encounters issues."""
     try:
         from pytubefix import YouTube
     except ImportError as err:
@@ -213,9 +204,9 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
     audio_only = raw in {"mp3", "audio", "bestaudio", "wav", "ogg"}
 
     last_error = None
-    for client in ["ANDROID", "WEB", "MWEB", "IOS"]:
+    for client in ["VISION_OS", "ANDROID", "WEB", "MWEB", "IOS"]:
         try:
-            yt = YouTube(url, client_type=client, proxies=proxies)
+            yt = YouTube(url, client=client, proxies=proxies)
             stream = None
             if audio_only:
                 stream = yt.streams.get_audio_only()
