@@ -12,21 +12,24 @@ Ye file aapke AWS EC2 deployment ki saari details aur commands ko save rakhne ke
 
 ---
 
-## 🍪 YouTube Cookies & Bot Detection Fix
-YouTube AWS / Cloud IPs ko block karta hai. Iska hal:
+## ⚡ Dual-Engine YouTube & Bot Bypass Architecture
+Backend ab **Dual-Engine Pipeline (`yt-dlp` + `pytubefix`)** use karta hai:
+- **Engine 1 (`yt-dlp`)**: Multi-client fallback (`ios`, `mweb`, `web`).
+- **Engine 2 (`pytubefix`)**: Agar YouTube bot challenge / 429 throw kare, system automatically background mein InnerTube engine se video download kar leta hai.
+- **Proxy Ready**: Future high-traffic ke liye `.env` mein `PROXY_URL=http://...` add kar sakte hain.
 
-1. **Node.js aur FFmpeg Install karein** (JS Challenge Solve karne ke liye):
-   ```bash
-   sudo apt update && sudo apt install -y nodejs ffmpeg
-   ```
-2. **Project dependencies update karein**:
-   ```bash
-   cd /home/ubuntu/Social-Downloader
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-3. **Cookies file ensure karein**:
-   `www.youtube.com_cookies.txt` ya `cookies.txt` project folder mein honi chahiye.
+---
+
+## 🚀 Server Par Update Apply Karne Ka Tareeqa (3 Steps)
+EC2 terminal par bas ye commands run karein:
+
+```bash
+cd /home/ubuntu/Social-Downloader
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart social-downloader
+```
 
 ---
 

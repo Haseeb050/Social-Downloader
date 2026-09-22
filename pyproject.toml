@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.116.1",
     "python-dotenv>=1.1.1",
     "python-multipart>=0.0.20",
+    "pytubefix>=11.1.0",
     "uvicorn>=0.35.0",
     "yt-dlp>=2025.7.21",
 ]

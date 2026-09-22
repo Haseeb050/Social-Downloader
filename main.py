@@ -26,6 +26,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 COOKIES_FROM_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "").strip().lower()
 
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or os.getenv("HTTP_PROXY", "").strip()
+
+
 def _get_cookie_file() -> str | None:
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
         return COOKIES_FILE
@@ -36,6 +39,7 @@ def _get_cookie_file() -> str | None:
         if os.path.isfile(candidate):
             return candidate
     return None
+
 
 QUALITY_HEIGHT = {
     "1080": 1080,
@@ -135,22 +139,20 @@ def _cleanup(path: str | None) -> None:
 
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
-    if "sign in" in text or "not a bot" in text:
-        return "YouTube blocked this cloud request (Bot Detection). Server par 'www.youtube.com_cookies.txt' update karein ya local par COOKIES_FROM_BROWSER=chrome set karein."
+    if "sign in" in text or "not a bot" in text or "429" in text:
+        return "YouTube rate-limited or blocked this request. Try again shortly or update cookies."
     if "empty media" in text or "login" in text or "cookies" in text:
         if platform == "instagram":
-            return "Instagram ne video nahi di. Public reel ho, ya cookies file provide karein."
-        return "This video needs login cookies. Provide cookies.txt on server or set COOKIES_FROM_BROWSER=chrome locally."
-    if "private" in text:
+            return "Instagram video unavailable. Ensure the post is public."
+        return "This video requires authentication."
+    if "private" in text or "unavailable" in text:
         return "This video is private or unavailable."
     if "ffmpeg" in text:
-        return "ffmpeg is required to merge this video. Install ffmpeg and retry."
-    if "impersonate" in text:
-        return "Download client setup failed. Retry after server reload."
+        return "ffmpeg is required to process this video."
     short = str(exc).split("\n")[0].strip()
     if len(short) > 220:
         short = short[:217] + "..."
-    return short or "Download failed. The video may be private, geo-blocked, or the site blocked this request."
+    return short or "Download failed. The video may be private, geo-blocked, or unavailable."
 
 
 def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
@@ -186,9 +188,11 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
     if platform == "youtube":
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
+                "player_client": ["ios", "mweb", "web"],
             }
         }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     cookie_file = _get_cookie_file()
     if cookie_file:
         opts["cookiefile"] = cookie_file
@@ -197,15 +201,77 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
     return opts
 
 
-def _extract_and_download(url: str, platform: str, ydl_format: str, output_template: str) -> dict:
-    opts = _ydl_opts(platform, ydl_format, output_template)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            raise RuntimeError("No video info returned.")
-        if info.get("_type") == "playlist" and info.get("entries"):
-            info = info["entries"][0] or {}
-        return info
+def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: str) -> tuple[str, str, str]:
+    """Secondary fallback engine using pytubefix for YouTube when yt-dlp encounters bot protection."""
+    try:
+        from pytubefix import YouTube
+    except ImportError as err:
+        raise RuntimeError("pytubefix is not installed.") from err
+
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    raw = (format_str or "best").strip().lower()
+    audio_only = raw in {"mp3", "audio", "bestaudio", "wav", "ogg"}
+
+    last_error = None
+    for client in ["ANDROID", "WEB", "MWEB", "IOS"]:
+        try:
+            yt = YouTube(url, client_type=client, proxies=proxies)
+            stream = None
+            if audio_only:
+                stream = yt.streams.get_audio_only()
+            else:
+                height = QUALITY_HEIGHT.get(raw)
+                if height:
+                    stream = yt.streams.filter(res=f"{height}p", file_extension="mp4").first()
+                if not stream:
+                    stream = yt.streams.get_highest_resolution() or yt.streams.first()
+
+            if not stream:
+                continue
+
+            title = yt.title or "video"
+            ext = "mp3" if audio_only else (stream.subtype or "mp4")
+            out_file = f"{uid}.{ext}"
+            saved_path = stream.download(output_path=download_dir, filename=out_file)
+            return saved_path, title, ext
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise last_error or RuntimeError("Could not download video via pytubefix fallback.")
+
+
+def _execute_download(url: str, platform: str, ydl_format: str, output_template: str, download_dir: str, uid: str, format_str: str) -> tuple[str, str, str]:
+    """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix if blocked."""
+    try:
+        opts = _ydl_opts(platform, ydl_format, output_template)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise RuntimeError("No video info returned.")
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = info["entries"][0] or {}
+
+            actual_file_path = None
+            for name in os.listdir(download_dir):
+                if name.startswith(uid):
+                    actual_file_path = os.path.join(download_dir, name)
+                    break
+
+            if actual_file_path and os.path.isfile(actual_file_path):
+                title = info.get("title") or info.get("id") or "video"
+                ext = os.path.splitext(actual_file_path)[1].lstrip(".") or "mp4"
+                return actual_file_path, str(title), ext
+    except Exception as ytdlp_err:
+        # If it's YouTube and yt-dlp failed, try pytubefix fallback
+        if platform == "youtube":
+            try:
+                return _download_with_pytubefix(url, format_str, download_dir, uid)
+            except Exception:
+                raise ytdlp_err from None
+        raise ytdlp_err
+
+    raise RuntimeError("Downloaded file not found on disk.")
 
 
 @app.get("/download")
@@ -229,12 +295,15 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         uid = uuid.uuid4().hex[:8]
         output_template = os.path.join(download_dir, f"{uid}.%(ext)s")
         try:
-            info = await asyncio.to_thread(
-                _extract_and_download,
+            actual_file_path, title, ext = await asyncio.to_thread(
+                _execute_download,
                 url,
                 platform,
                 ydl_format,
                 output_template,
+                download_dir,
+                uid,
+                format,
             )
         except HTTPException:
             _cleanup(download_dir)
@@ -243,18 +312,10 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             _cleanup(download_dir)
             raise HTTPException(status_code=502, detail=_public_error(platform, exc)) from exc
 
-        actual_file_path = None
-        for name in os.listdir(download_dir):
-            if name.startswith(uid):
-                actual_file_path = os.path.join(download_dir, name)
-                break
-
         if not actual_file_path or not os.path.isfile(actual_file_path):
             _cleanup(download_dir)
             raise HTTPException(status_code=500, detail="Download finished but the file was not found.")
 
-        title = info.get("title") or info.get("id") or "video"
-        ext = os.path.splitext(actual_file_path)[1].lstrip(".") or ("mp3" if audio_only else "mp4")
         media_type = "audio/mpeg" if audio_only or ext == "mp3" else "video/mp4"
         file_to_stream = actual_file_path
         dir_to_clean = download_dir
@@ -273,7 +334,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         return StreamingResponse(
             iterfile(),
             media_type=media_type,
-            headers={"Content-Disposition": _content_disposition(str(title), ext)},
+            headers={"Content-Disposition": _content_disposition(title, ext)},
         )
 
 
