@@ -182,6 +182,12 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
             "node": {"path": "node"},
         },
     }
+    if platform == "youtube":
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "web_creator", "mweb", "web"],
+            }
+        }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     cookie_file = _get_cookie_file()
