@@ -109,10 +109,10 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]/b",
+            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best/b",
             False,
         )
-    return "b[ext=mp4]/bv*+ba/b", False
+    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best/b", False
 
 
 def _safe_filename(title: str, ext: str) -> str:
