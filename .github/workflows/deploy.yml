@@ -18,8 +18,11 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script: |
+            set -e
             cd /home/ubuntu/Social-Downloader
-            git pull origin main
+            git fetch origin main
+            git reset --hard origin/main
             source .venv/bin/activate
             pip install -r requirements.txt
             sudo systemctl restart social-downloader
+            sudo systemctl is-active --quiet social-downloader && echo "Deployment Successful"
