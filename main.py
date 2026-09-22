@@ -32,7 +32,7 @@ PROXY_URL = os.getenv("PROXY_URL", "").strip() or os.getenv("HTTP_PROXY", "").st
 def _get_cookie_file() -> str | None:
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
         return COOKIES_FILE
-    for candidate in ["www.youtube.com_cookies.txt", "cookies.txt", "youtube_cookies.txt"]:
+    for candidate in ["cookies.txt", "youtube_cookies.txt"]:
         path = os.path.join(BASE_DIR, candidate)
         if os.path.isfile(path):
             return path
@@ -109,10 +109,10 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"best[height<={height}]/bestvideo[height<={height}]+bestaudio/best",
+            f"best[height<={height}]/bestvideo[height<={height}]+bestaudio/best/18/b",
             False,
         )
-    return "best/bestvideo+bestaudio/b", False
+    return "best/bestvideo+bestaudio/18/b", False
 
 
 def _safe_filename(title: str, ext: str) -> str:
@@ -185,7 +185,8 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
     if platform == "youtube":
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "web_creator", "mweb", "web"],
+                "player_client": ["android", "ios", "web_creator"],
+                "player_skip": ["webpage", "configs"],
             }
         }
     if PROXY_URL:
