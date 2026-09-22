@@ -139,14 +139,14 @@ def _cleanup(path: str | None) -> None:
 
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
+    if "unavailable" in text or "private" in text or "does not exist" in text:
+        return "This video is unavailable, deleted, or private on YouTube."
     if "sign in" in text or "not a bot" in text or "429" in text:
         return "YouTube rate-limited or blocked this request. Try again shortly or update cookies."
     if "empty media" in text or "login" in text or "cookies" in text:
         if platform == "instagram":
             return "Instagram video unavailable. Ensure the post is public."
         return "This video requires authentication."
-    if "private" in text or "unavailable" in text:
-        return "This video is private or unavailable."
     if "ffmpeg" in text:
         return "ffmpeg is required to process this video."
     short = str(exc).split("\n")[0].strip()
