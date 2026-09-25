@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -97,6 +99,41 @@ def _platform(url: str) -> str | None:
     return None
 
 
+def _resolve_url(url: str) -> str:
+    """Follow HTTP redirects for short URLs (e.g. Reddit /s/, Snapchat /t/, TikTok vt/vm, LinkedIn lnkd.in, etc.)."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    needs_resolve = (
+        "/s/" in parsed.path
+        or "/share/" in parsed.path
+        or "/t/" in parsed.path
+        or host in {"lnkd.in", "pin.it", "t.co", "vt.tiktok.com", "vm.tiktok.com", "fb.watch", "youtu.be", "redd.it"}
+    )
+    if not needs_resolve:
+        return url
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+            return e.headers.get("Location")
+        return url
+    except Exception:
+        return url
+
+
 def _normalize_url(url: str, platform: str) -> str:
     parsed = urlparse(url)
     if platform == "instagram":
@@ -129,10 +166,10 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"best[height<={height}]/bestvideo[height<={height}]+bestaudio/best/18/b",
+            f"bestvideo*[height<={height}]+bestaudio/best[height<={height}]/bv*+ba/b",
             False,
         )
-    return "best/bestvideo+bestaudio/18/b", False
+    return "bestvideo*+bestaudio/best/bv*+ba/b", False
 
 
 def _safe_filename(title: str, ext: str) -> str:
@@ -312,6 +349,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
     if not _is_http_url(url):
         raise HTTPException(status_code=400, detail="url must be a valid http or https link.")
 
+    url = await asyncio.to_thread(_resolve_url, url)
     platform = _platform(url)
     if not platform:
         raise HTTPException(
