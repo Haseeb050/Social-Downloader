@@ -16,7 +16,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Social Media Video Downloader",
-    description="Local downloader for YouTube, Instagram, TikTok, X (Twitter), and Facebook (yt-dlp).",
+    description="Downloader for YouTube, Instagram, TikTok, X (Twitter), Facebook, Snapchat, LinkedIn, Reddit, Pinterest, and Threads (yt-dlp).",
 )
 
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
@@ -84,6 +84,16 @@ def _platform(url: str) -> str | None:
         return "twitter"
     if host in {"facebook.com", "fb.watch", "fb.com", "m.facebook.com", "web.facebook.com"} or host.endswith(".facebook.com"):
         return "facebook"
+    if host in {"snapchat.com", "story.snapchat.com"} or host.endswith(".snapchat.com"):
+        return "snapchat"
+    if host in {"linkedin.com", "lnkd.in"} or host.endswith(".linkedin.com"):
+        return "linkedin"
+    if host in {"reddit.com", "redd.it", "v.redd.it"} or host.endswith(".reddit.com"):
+        return "reddit"
+    if host in {"pinterest.com", "pin.it"} or host.endswith(".pinterest.com"):
+        return "pinterest"
+    if host in {"threads.net"} or host.endswith(".threads.net"):
+        return "threads"
     return None
 
 
@@ -105,6 +115,9 @@ def _normalize_url(url: str, platform: str) -> str:
     if platform == "twitter":
         clean_path = parsed.path.rstrip("/")
         return f"https://x.com{clean_path}"
+    if platform == "reddit":
+        clean_path = parsed.path.rstrip("/")
+        return f"https://www.reddit.com{clean_path}"
     return url
 
 
@@ -155,6 +168,12 @@ def _public_error(platform: str, exc: Exception) -> str:
             return "Instagram video unavailable. Ensure the post is public."
         if platform == "facebook":
             return "Facebook video unavailable. Ensure the post/reel is public."
+        if platform == "snapchat":
+            return "Snapchat video unavailable or expired. Ensure it is public."
+        if platform == "linkedin":
+            return "LinkedIn video unavailable. Ensure the post is public."
+        if platform == "reddit":
+            return "Reddit video unavailable or deleted."
         return "This video requires authentication."
     if "ffmpeg" in text:
         return "ffmpeg is required to process this video."
@@ -171,6 +190,11 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
         "tiktok": "https://www.tiktok.com/",
         "twitter": "https://x.com/",
         "facebook": "https://www.facebook.com/",
+        "snapchat": "https://www.snapchat.com/",
+        "linkedin": "https://www.linkedin.com/",
+        "reddit": "https://www.reddit.com/",
+        "pinterest": "https://www.pinterest.com/",
+        "threads": "https://www.threads.net/",
     }
     opts = {
         "format": ydl_format,
@@ -292,7 +316,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
     if not platform:
         raise HTTPException(
             status_code=400,
-            detail="Only YouTube, Instagram, TikTok, X (Twitter), and Facebook URLs are supported.",
+            detail="Only YouTube, Instagram, TikTok, X (Twitter), Facebook, Snapchat, LinkedIn, Reddit, Pinterest, and Threads URLs are supported.",
         )
 
     url = _normalize_url(url, platform)
@@ -366,10 +390,10 @@ HOME_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Social Video Downloader</h1>
-  <p class="hint">Supported: YouTube, Instagram, TikTok, X (Twitter), Facebook.</p>
+  <p class="hint">Supported: YouTube, Instagram, TikTok, X (Twitter), Facebook, Snapchat, LinkedIn, Reddit, Pinterest, Threads.</p>
   <form action="/download" method="get">
     <label for="url">Video URL</label>
-    <input id="url" name="url" type="url" required placeholder="https://x.com/... or https://www.tiktok.com/@... or https://www.facebook.com/..." />
+    <input id="url" name="url" type="url" required placeholder="https://x.com/... or https://snapchat.com/... or https://reddit.com/..." />
     <label for="format">Quality</label>
     <select id="format" name="format">
       <option value="best" selected>Best</option>
@@ -395,7 +419,18 @@ async def root():
 async def health():
     return {
         "ok": True,
-        "platforms": ["youtube", "instagram", "tiktok", "twitter", "facebook"],
+        "platforms": [
+            "youtube",
+            "instagram",
+            "tiktok",
+            "twitter",
+            "facebook",
+            "snapchat",
+            "linkedin",
+            "reddit",
+            "pinterest",
+            "threads",
+        ],
         "backend": "yt-dlp",
         "docs": "/docs",
     }
