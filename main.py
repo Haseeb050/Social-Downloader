@@ -10,9 +10,10 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import yt_dlp
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 
 load_dotenv()
 
@@ -22,13 +23,34 @@ app = FastAPI(
 )
 
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN") or "http://127.0.0.1:8000"
+ALLOWED_ORIGIN_ENV = os.getenv("ALLOWED_ORIGIN") or "http://127.0.0.1:8000,*"
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGIN_ENV.split(",") if origin.strip()]
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 COOKIES_FROM_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "").strip().lower()
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or os.getenv("HTTP_PROXY", "").strip()
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_query = APIKeyQuery(name="api_key", auto_error=False)
+
+
+def _verify_api_key(
+    header_key: str | None = Security(api_key_header),
+    query_key: str | None = Security(api_key_query),
+):
+    """If API_SECRET_KEY is configured in .env, require it in headers or query params."""
+    if not API_SECRET_KEY:
+        return True
+    key = header_key or query_key
+    if not key or key != API_SECRET_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid or missing API Key. Pass 'X-API-Key' header or '?api_key=' parameter.",
+        )
+    return True
 
 
 def _get_cookie_file() -> str | None:
@@ -58,7 +80,7 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
+    allow_origins=ALLOWED_ORIGINS if "*" not in ALLOWED_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,26 +98,12 @@ def _is_http_url(url: str) -> bool:
 
 def _platform(url: str) -> str | None:
     host = _host(url)
-    if host in {"youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com"} or host.endswith(".youtube.com"):
-        return "youtube"
-    if host in {"instagram.com", "instagr.am"} or host.endswith(".instagram.com"):
-        return "instagram"
-    if host in {"tiktok.com", "vm.tiktok.com", "vt.tiktok.com"} or host.endswith(".tiktok.com"):
-        return "tiktok"
     if host in {"twitter.com", "x.com", "t.co"} or host.endswith(".twitter.com") or host.endswith(".x.com"):
         return "twitter"
     if host in {"facebook.com", "fb.watch", "fb.com", "m.facebook.com", "web.facebook.com"} or host.endswith(".facebook.com"):
         return "facebook"
-    if host in {"snapchat.com", "story.snapchat.com"} or host.endswith(".snapchat.com"):
-        return "snapchat"
-    if host in {"linkedin.com", "lnkd.in"} or host.endswith(".linkedin.com"):
-        return "linkedin"
     if host in {"reddit.com", "redd.it", "v.redd.it"} or host.endswith(".reddit.com"):
         return "reddit"
-    if host in {"pinterest.com", "pin.it"} or host.endswith(".pinterest.com"):
-        return "pinterest"
-    if host in {"threads.net"} or host.endswith(".threads.net"):
-        return "threads"
     return None
 
 
@@ -344,7 +352,7 @@ def _execute_download(url: str, platform: str, ydl_format: str, output_template:
     raise RuntimeError("Downloaded file not found on disk.")
 
 
-@app.get("/download")
+@app.get("/download", dependencies=[Depends(_verify_api_key)])
 async def download_video(url: str = Query(...), format: str = Query("best")):
     if not _is_http_url(url):
         raise HTTPException(status_code=400, detail="url must be a valid http or https link.")
@@ -354,7 +362,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
     if not platform:
         raise HTTPException(
             status_code=400,
-            detail="Only YouTube, Instagram, TikTok, X (Twitter), Facebook, Snapchat, LinkedIn, Reddit, Pinterest, and Threads URLs are supported.",
+            detail="Currently, only Facebook, Twitter (X), and Reddit video links are supported. Please provide a valid link from Facebook, Twitter, or Reddit.",
         )
 
     url = _normalize_url(url, platform)
@@ -409,12 +417,64 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         )
 
 
+@app.get("/api/info", dependencies=[Depends(_verify_api_key)])
+async def get_media_info(url: str = Query(...)):
+    """API endpoint for developers/WordPress to extract media metadata (title, thumbnail, duration, platform)."""
+    if not _is_http_url(url):
+        raise HTTPException(status_code=400, detail="url must be a valid http or https link.")
+
+    url = await asyncio.to_thread(_resolve_url, url)
+    platform = _platform(url)
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="Currently, only Facebook, Twitter (X), and Reddit video links are supported. Please provide a valid link from Facebook, Twitter, or Reddit.",
+        )
+
+    url = _normalize_url(url, platform)
+
+    def _extract():
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
+            },
+        }
+        cookie_file = _get_cookie_file()
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
+        if PROXY_URL:
+            opts["proxy"] = PROXY_URL
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and info.get("_type") == "playlist" and info.get("entries"):
+                info = info["entries"][0]
+            return info
+
+    try:
+        info = await asyncio.to_thread(_extract)
+        return {
+            "status": "success",
+            "platform": platform,
+            "title": info.get("title") or "Video",
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+            "formats": ["best", "1080p", "720p", "480p", "360p", "mp3"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=_public_error(platform, e))
+
+
 HOME_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Social Downloader</title>
+  <title>Facebook, Twitter & Reddit Video Downloader</title>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: Segoe UI, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; }
@@ -428,10 +488,10 @@ HOME_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Social Video Downloader</h1>
-  <p class="hint">Supported: YouTube, Instagram, TikTok, X (Twitter), Facebook, Snapchat, LinkedIn, Reddit, Pinterest, Threads.</p>
+  <p class="hint">Supported: Facebook, Twitter (X), Reddit.</p>
   <form action="/download" method="get">
     <label for="url">Video URL</label>
-    <input id="url" name="url" type="url" required placeholder="https://x.com/... or https://snapchat.com/... or https://reddit.com/..." />
+    <input id="url" name="url" type="url" required placeholder="https://x.com/... or https://facebook.com/... or https://reddit.com/..." />
     <label for="format">Quality</label>
     <select id="format" name="format">
       <option value="best" selected>Best</option>
@@ -458,16 +518,9 @@ async def health():
     return {
         "ok": True,
         "platforms": [
-            "youtube",
-            "instagram",
-            "tiktok",
-            "twitter",
             "facebook",
-            "snapchat",
-            "linkedin",
+            "twitter",
             "reddit",
-            "pinterest",
-            "threads",
         ],
         "backend": "yt-dlp",
         "docs": "/docs",
