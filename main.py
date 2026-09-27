@@ -42,20 +42,20 @@ api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
 
 def _clean_old_cache():
-    """Remove cache files older than 15 minutes so files remain available for Safari Range requests and downloads."""
+    """Remove cache files older than 20 minutes so files remain available for mobile Safari Range requests and multi-part downloads."""
     try:
         now = time.time()
         for root, dirs, files in os.walk(CACHE_DIR):
             for f in files:
                 p = os.path.join(root, f)
-                if os.path.isfile(p) and (now - os.path.getmtime(p) > 900):
+                if os.path.isfile(p) and (now - os.path.getmtime(p) > 1200):
                     try:
                         os.remove(p)
                     except Exception:
                         pass
             for d in dirs:
                 dp = os.path.join(root, d)
-                if os.path.isdir(dp) and (now - os.path.getmtime(dp) > 900):
+                if os.path.isdir(dp) and (now - os.path.getmtime(dp) > 1200):
                     try:
                         shutil.rmtree(dp, ignore_errors=True)
                     except Exception:
@@ -110,6 +110,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Disposition", "Content-Type", "Accept-Ranges"],
 )
 
 
@@ -360,7 +361,7 @@ def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
     temp_target = file_path + ".ios_fixed.mp4"
 
     try:
-        # Step 1: Fast remux with faststart and AAC audio (Takes <0.1 sec)
+        # Fast remux with faststart and AAC audio (Takes <0.1 sec)
         cmd_remux = [
             ffmpeg_bin, "-y", "-i", file_path,
             "-c:v", "copy",
@@ -376,7 +377,7 @@ def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
         pass
 
     try:
-        # Step 2: If copy failed (e.g. non-H264 video stream), transcode with libx264 veryfast
+        # Fallback transcode with libx264 veryfast
         cmd_transcode = [
             ffmpeg_bin, "-y", "-i", file_path,
             "-c:v", "libx264",
@@ -528,13 +529,17 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
         clean_ext = "mp3" if audio_only or ext == "mp3" else ext
         media_type = "audio/mpeg" if audio_only or clean_ext == "mp3" else "video/mp4"
         safe_name = _safe_filename(title, clean_ext)
+        file_size = os.path.getsize(actual_file_path)
 
         return FileResponse(
             path=actual_file_path,
             media_type=media_type,
             filename=safe_name,
             headers={
+                "Content-Length": str(file_size),
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
                 "Accept-Ranges": "bytes",
+                "Access-Control-Expose-Headers": "Content-Length, Content-Disposition, Content-Type, Accept-Ranges",
                 "Cache-Control": "public, max-age=3600",
             },
         )
@@ -856,7 +861,6 @@ HOME_PAGE = """<!DOCTYPE html>
       btnText.innerText = 'Processing...';
       hint.style.display = 'block';
 
-      // Reset UI after 12 seconds
       setTimeout(() => {
         spinner.style.display = 'none';
         btnText.innerText = 'Download Video';
