@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import yt_dlp
 from dotenv import load_dotenv
@@ -148,18 +148,62 @@ def _platform(url: str) -> str | None:
     return None
 
 
+def _resolve_facebook_share_url(url: str) -> str:
+    """Extract canonical /reel/ or /watch/ URL from Facebook share links."""
+    parsed = urlparse(url)
+    if "/share/" not in parsed.path and "fb.watch" not in parsed.netloc:
+        return url
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+        )
+
+        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def http_error_302(self, req, fp, code, msg, headers):
+                return headers
+            http_error_301 = http_error_302
+            http_error_303 = http_error_302
+            http_error_307 = http_error_302
+            http_error_308 = http_error_302
+
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        resp = opener.open(req, timeout=6)
+        loc = resp.headers.get("Location") if hasattr(resp, "headers") else None
+
+        if loc:
+            if "next=" in loc:
+                next_val = parse_qs(urlparse(loc).query).get("next", [None])[0]
+                if next_val:
+                    clean_next = unquote(next_val)
+                    if "facebook.com" in clean_next and "login" not in clean_next:
+                        return clean_next
+            elif "login" not in loc and ("reel" in loc or "watch" in loc or "video" in loc):
+                return loc
+    except Exception:
+        pass
+
+    return url
+
+
 def _resolve_url(url: str) -> str:
     """Follow HTTP redirects for short URLs (Reddit, Snapchat, TikTok, LinkedIn, etc.)."""
     parsed = urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.")
 
-    # Facebook, Instagram & TikTok URLs should NOT be resolved with urllib because Meta/TikTok 302-redirects bot requests to /login!
-    if "facebook.com" in host or "fb.watch" in host or "fb.com" in host or "instagram.com" in host or "tiktok.com" in host:
+    if "facebook.com" in host or "fb.watch" in host or "fb.com" in host:
+        return _resolve_facebook_share_url(url)
+
+    if "instagram.com" in host or "tiktok.com" in host:
         return url
 
     needs_resolve = (
         "/s/" in parsed.path
-        or "/share/" in parsed.path
         or "/t/" in parsed.path
         or host in {"lnkd.in", "pin.it", "t.co", "youtu.be", "redd.it"}
     )
@@ -190,6 +234,15 @@ def _resolve_url(url: str) -> str:
 
 def _normalize_url(url: str, platform: str) -> str:
     parsed = urlparse(url)
+    if platform == "facebook":
+        clean_path = parsed.path.rstrip("/")
+        # Remove tracking query parameters like mibextid, __tn__, etc.
+        query_dict = parse_qs(parsed.query)
+        clean_params = {}
+        if "v" in query_dict:
+            clean_params["v"] = query_dict["v"]
+        new_query = urlencode(clean_params, doseq=True)
+        return f"https://www.facebook.com{clean_path}" + (f"?{new_query}" if new_query else "")
     if platform == "instagram":
         return f"https://www.instagram.com{parsed.path.rstrip('/')}/"
     if platform == "youtube":
@@ -581,7 +634,6 @@ async def download_video(
     format: str = Query("best"),
     api_key: str | None = Query(None),
 ):
-    # API key check
     if API_SECRET_KEY and api_key != API_SECRET_KEY and request.headers.get("X-API-Key") != API_SECRET_KEY:
         return _render_error_page("Unauthorized request. Invalid API Key.", 401)
 
