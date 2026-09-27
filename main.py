@@ -148,67 +148,10 @@ def _platform(url: str) -> str | None:
     return None
 
 
-def _resolve_facebook_share_url(url: str) -> str:
-    """Extract canonical /reel/ or /watch/ URL from Facebook share links."""
-    parsed = urlparse(url)
-    if "/share/" not in parsed.path and "fb.watch" not in parsed.netloc:
-        return url
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            },
-        )
-
-        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-            def http_error_302(self, req, fp, code, msg, headers):
-                return headers
-            http_error_301 = http_error_302
-            http_error_303 = http_error_302
-            http_error_307 = http_error_302
-            http_error_308 = http_error_302
-
-        opener = urllib.request.build_opener(NoRedirectHandler)
-        resp = opener.open(req, timeout=6)
-        loc = resp.headers.get("Location") if hasattr(resp, "headers") else None
-
-        if loc:
-            if "next=" in loc:
-                next_val = parse_qs(urlparse(loc).query).get("next", [None])[0]
-                if next_val:
-                    clean_next = unquote(next_val)
-                    if "facebook.com" in clean_next and "login" not in clean_next:
-                        return clean_next
-            elif "login" not in loc and ("reel" in loc or "watch" in loc or "video" in loc):
-                return loc
-    except Exception:
-        pass
-
-    return url
-
-
 def _resolve_url(url: str) -> str:
-    """Follow HTTP redirects for short URLs (Reddit, Snapchat, TikTok, LinkedIn, etc.)."""
+    """Follow HTTP redirects for short URLs (Facebook share, Reddit, Snapchat, TikTok, LinkedIn, etc.)."""
     parsed = urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.")
-
-    if "facebook.com" in host or "fb.watch" in host or "fb.com" in host:
-        return _resolve_facebook_share_url(url)
-
-    if "instagram.com" in host or "tiktok.com" in host:
-        return url
-
-    needs_resolve = (
-        "/s/" in parsed.path
-        or "/t/" in parsed.path
-        or host in {"lnkd.in", "pin.it", "t.co", "youtu.be", "redd.it"}
-    )
-    if not needs_resolve:
-        return url
 
     try:
         req = urllib.request.Request(
@@ -219,24 +162,38 @@ def _resolve_url(url: str) -> str:
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.geturl()
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            final_url = resp.geturl()
+            if "login" not in final_url:
+                return final_url
+            query = parse_qs(urlparse(final_url).query)
+            if "next" in query and query["next"]:
+                target = unquote(query["next"][0])
+                if "facebook.com" in target and "login" not in target:
+                    return target
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
-            return e.headers.get("Location")
-        return url
+            loc = e.headers.get("Location")
+            if "login" not in loc:
+                return loc
+            query = parse_qs(urlparse(loc).query)
+            if "next" in query and query["next"]:
+                target = unquote(query["next"][0])
+                if "facebook.com" in target and "login" not in target:
+                    return target
     except Exception:
-        return url
+        pass
+
+    return url
 
 
 def _normalize_url(url: str, platform: str) -> str:
     parsed = urlparse(url)
     if platform == "facebook":
         clean_path = parsed.path.rstrip("/")
-        # Remove tracking query parameters like mibextid, __tn__, etc.
         query_dict = parse_qs(parsed.query)
         clean_params = {}
         if "v" in query_dict:
@@ -276,20 +233,17 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"bestvideo[height<={height}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a]/"
-            f"bestvideo[height<={height}][vcodec^=avc]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={height}][ext=mp4]+bestaudio[acodec^=mp4a]/"
+            f"best[height<={height}][ext=mp4]/"
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]/best",
             False,
         )
     return (
-        "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a]/"
-        "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/"
-        "bestvideo[ext=mp4]+bestaudio[acodec^=mp4a]/"
+        "best[ext=mp4]/"
         "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/best",
+        "bestvideo+bestaudio/"
+        "best",
         False,
     )
 
@@ -305,6 +259,7 @@ def _safe_filename(title: str, ext: str) -> str:
 
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
+    print(f"[{platform}] Download error: {exc}")
     if "unavailable" in text or "private" in text or "does not exist" in text:
         return f"This video is unavailable, deleted, or private on {platform.capitalize()}."
     if "sign in" in text or "not a bot" in text or "429" in text:
