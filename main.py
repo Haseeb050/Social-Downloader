@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -228,19 +229,64 @@ def _public_error(platform: str, exc: Exception) -> str:
     return short or "Download failed. The video may be private, geo-blocked, or unavailable."
 
 
+REFERERS = {
+    "youtube": "https://www.youtube.com/",
+    "instagram": "https://www.instagram.com/",
+    "tiktok": "https://www.tiktok.com/",
+    "twitter": "https://x.com/",
+    "facebook": "https://www.facebook.com/",
+    "snapchat": "https://www.snapchat.com/",
+    "linkedin": "https://www.linkedin.com/",
+    "reddit": "https://www.reddit.com/",
+    "pinterest": "https://www.pinterest.com/",
+    "threads": "https://www.threads.net/",
+}
+
+
+def _download_image(url: str, dest_path: str, referer: str = "https://www.facebook.com/") -> bool:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Referer": referer,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp, open(dest_path, "wb") as out:
+            out.write(resp.read())
+        return os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
+    except Exception:
+        return False
+
+
+def _merge_image_and_audio(image_path: str, audio_path: str, output_path: str) -> bool:
+    """Converts a static image + audio file into an MP4 video using ffmpeg."""
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loop", "1",
+            "-i", image_path,
+            "-i", audio_path,
+            "-c:v", "libx264",
+            "-tune", "stillimage",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-shortest",
+            output_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        return result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+    except Exception:
+        return False
+
+
 def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
-    referers = {
-        "youtube": "https://www.youtube.com/",
-        "instagram": "https://www.instagram.com/",
-        "tiktok": "https://www.tiktok.com/",
-        "twitter": "https://x.com/",
-        "facebook": "https://www.facebook.com/",
-        "snapchat": "https://www.snapchat.com/",
-        "linkedin": "https://www.linkedin.com/",
-        "reddit": "https://www.reddit.com/",
-        "pinterest": "https://www.pinterest.com/",
-        "threads": "https://www.threads.net/",
-    }
     opts = {
         "format": ydl_format,
         "outtmpl": output_template,
@@ -248,6 +294,7 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "merge_output_format": "mp4",
+        "writethumbnail": True,
         "socket_timeout": 30,
         "retries": 3,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
@@ -256,7 +303,7 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Referer": referers.get(platform, "https://www.google.com/"),
+            "Referer": REFERERS.get(platform, "https://www.google.com/"),
         },
         "js_runtimes": {
             "node": {"path": "node"},
@@ -319,8 +366,19 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
     raise last_error or RuntimeError("Could not download video via pytubefix fallback.")
 
 
-def _execute_download(url: str, platform: str, ydl_format: str, output_template: str, download_dir: str, uid: str, format_str: str) -> tuple[str, str, str]:
-    """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix if blocked."""
+def _execute_download(
+    url: str,
+    platform: str,
+    ydl_format: str,
+    output_template: str,
+    download_dir: str,
+    uid: str,
+    format_str: str,
+    audio_only: bool = False,
+) -> tuple[str, str, str]:
+    """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix if blocked.
+    Also handles Facebook/Instagram Photo+Music stories by merging image and audio into MP4.
+    """
     try:
         opts = _ydl_opts(platform, ydl_format, output_template)
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -330,16 +388,62 @@ def _execute_download(url: str, platform: str, ydl_format: str, output_template:
             if info.get("_type") == "playlist" and info.get("entries"):
                 info = info["entries"][0] or {}
 
-            actual_file_path = None
-            for name in os.listdir(download_dir):
-                if name.startswith(uid):
-                    actual_file_path = os.path.join(download_dir, name)
-                    break
+            video_exts = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi"}
+            audio_exts = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac"}
+            image_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
-            if actual_file_path and os.path.isfile(actual_file_path):
-                title = info.get("title") or info.get("id") or "video"
-                ext = os.path.splitext(actual_file_path)[1].lstrip(".") or "mp4"
-                return actual_file_path, str(title), ext
+            vid_file = None
+            aud_file = None
+            img_file = None
+
+            for name in os.listdir(download_dir):
+                if not name.startswith(uid):
+                    continue
+                full_path = os.path.join(download_dir, name)
+                if not os.path.isfile(full_path):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in video_exts and not vid_file:
+                    vid_file = full_path
+                elif ext in audio_exts and not aud_file:
+                    aud_file = full_path
+                elif ext in image_exts and not img_file:
+                    img_file = full_path
+
+            title = info.get("title") or info.get("id") or "video"
+
+            # Case 1: Audio only explicitly requested
+            if audio_only:
+                target_file = aud_file or vid_file
+                if target_file:
+                    ext = os.path.splitext(target_file)[1].lstrip(".") or "mp3"
+                    return target_file, str(title), ext
+
+            # Case 2: Video file downloaded successfully
+            if vid_file:
+                ext = os.path.splitext(vid_file)[1].lstrip(".") or "mp4"
+                return vid_file, str(title), ext
+
+            # Case 3: Only audio downloaded (e.g., Photo+Music story), auto-merge with image
+            if aud_file:
+                if not img_file:
+                    thumb_url = info.get("thumbnail")
+                    if not thumb_url and info.get("thumbnails"):
+                        thumb_url = info["thumbnails"][-1].get("url")
+                    if thumb_url:
+                        candidate_img = os.path.join(download_dir, f"{uid}_thumb.jpg")
+                        if _download_image(thumb_url, candidate_img, REFERERS.get(platform, "https://www.facebook.com/")):
+                            img_file = candidate_img
+
+                if img_file:
+                    merged_mp4 = os.path.join(download_dir, f"{uid}_merged.mp4")
+                    if _merge_image_and_audio(img_file, aud_file, merged_mp4):
+                        return merged_mp4, str(title), "mp4"
+
+                # Fallback if ffmpeg merge fails
+                ext = os.path.splitext(aud_file)[1].lstrip(".") or "mp3"
+                return aud_file, str(title), ext
+
     except Exception as ytdlp_err:
         # If it's YouTube and yt-dlp failed, try pytubefix fallback
         if platform == "youtube":
@@ -383,6 +487,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
                 download_dir,
                 uid,
                 format,
+                audio_only,
             )
         except HTTPException:
             _cleanup(download_dir)
@@ -395,7 +500,7 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
             _cleanup(download_dir)
             raise HTTPException(status_code=500, detail="Download finished but the file was not found.")
 
-        media_type = "audio/mpeg" if audio_only or ext == "mp3" else "video/mp4"
+        media_type = "audio/mpeg" if audio_only or ext in {"mp3", "m4a", "wav", "ogg", "opus"} else "video/mp4"
         file_to_stream = actual_file_path
         dir_to_clean = download_dir
 
