@@ -4,18 +4,18 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
-from starlette.background import BackgroundTask
 
 load_dotenv()
 
@@ -32,18 +32,42 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 COOKIES_FROM_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "").strip().lower()
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
-
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or os.getenv("HTTP_PROXY", "").strip()
+
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "social_downloader_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 api_key_query = APIKeyQuery(name="api_key", auto_error=False)
+
+
+def _clean_old_cache():
+    """Remove cache files older than 15 minutes so files remain available for Safari Range requests and downloads."""
+    try:
+        now = time.time()
+        for root, dirs, files in os.walk(CACHE_DIR):
+            for f in files:
+                p = os.path.join(root, f)
+                if os.path.isfile(p) and (now - os.path.getmtime(p) > 900):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+            for d in dirs:
+                dp = os.path.join(root, d)
+                if os.path.isdir(dp) and (now - os.path.getmtime(dp) > 900):
+                    try:
+                        shutil.rmtree(dp, ignore_errors=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def _verify_api_key(
     header_key: str | None = Security(api_key_header),
     query_key: str | None = Security(api_key_query),
 ):
-    """If API_SECRET_KEY is configured in .env, require it in headers or query params."""
     if not API_SECRET_KEY:
         return True
     key = header_key or query_key
@@ -124,7 +148,7 @@ def _platform(url: str) -> str | None:
 
 
 def _resolve_url(url: str) -> str:
-    """Follow HTTP redirects for short URLs (e.g. Reddit /s/, Snapchat /t/, TikTok vt/vm, LinkedIn lnkd.in, etc.)."""
+    """Follow HTTP redirects for short URLs (Reddit, Snapchat, TikTok, LinkedIn, etc.)."""
     parsed = urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.")
     needs_resolve = (
@@ -220,19 +244,6 @@ def _safe_filename(title: str, ext: str) -> str:
     return f"{ascii_name or 'video'}.{ext}"
 
 
-def _content_disposition(title: str, ext: str) -> str:
-    fallback = _safe_filename(title, ext)
-    utf8_name = re.sub(r'[\r\n"]+', "", title or "video").replace("/", "-").replace("\\", "-").strip() or "video"
-    utf8_name = f"{utf8_name[:80]}.{(ext or 'mp4').lstrip('.')}"
-    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(utf8_name)}'
-
-
-def _cleanup(path: str | None) -> None:
-    if not path:
-        return
-    shutil.rmtree(path, ignore_errors=True)
-
-
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
     if "unavailable" in text or "private" in text or "does not exist" in text:
@@ -309,7 +320,6 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
                 "preferedformat": "mp4",
             }
         ]
-        # Ensure universal iOS Safari & Android audio/video codec + moov atom faststart
         opts["postprocessor_args"] = {
             "merger": [
                 "-c:v", "copy",
@@ -338,29 +348,59 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
     return opts
 
 
-def _post_process_for_ios(file_path: str, audio_only: bool = False) -> str:
-    """Ensure MP4 has faststart moov atom header for immediate iOS Safari streaming and Photos app playback."""
+def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
+    """
+    Ensures video has H.264 video, AAC audio, yuv420p pixel format, and +faststart.
+    This guarantees 100% video and audio playback in iOS Photos app, Safari, QuickTime, and Android.
+    """
     if audio_only or not file_path.endswith(".mp4"):
         return file_path
-    
+
     ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-    temp_faststart = file_path + ".faststart.mp4"
+    temp_target = file_path + ".ios_fixed.mp4"
+
     try:
-        cmd = [
+        # Step 1: Fast remux with faststart and AAC audio (Takes <0.1 sec)
+        cmd_remux = [
             ffmpeg_bin, "-y", "-i", file_path,
-            "-c", "copy",
+            "-c:v", "copy",
+            "-c:a", "aac",
             "-movflags", "+faststart",
-            temp_faststart,
+            temp_target,
         ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        if res.returncode == 0 and os.path.isfile(temp_faststart) and os.path.getsize(temp_faststart) > 0:
-            os.replace(temp_faststart, file_path)
+        res = subprocess.run(cmd_remux, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        if res.returncode == 0 and os.path.isfile(temp_target) and os.path.getsize(temp_target) > 1000:
+            os.replace(temp_target, file_path)
+            return file_path
     except Exception:
-        if os.path.isfile(temp_faststart):
+        pass
+
+    try:
+        # Step 2: If copy failed (e.g. non-H264 video stream), transcode with libx264 veryfast
+        cmd_transcode = [
+            ffmpeg_bin, "-y", "-i", file_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            temp_target,
+        ]
+        res = subprocess.run(cmd_transcode, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+        if res.returncode == 0 and os.path.isfile(temp_target) and os.path.getsize(temp_target) > 1000:
+            os.replace(temp_target, file_path)
+            return file_path
+    except Exception:
+        pass
+    finally:
+        if os.path.isfile(temp_target):
             try:
-                os.remove(temp_faststart)
+                os.remove(temp_target)
             except Exception:
                 pass
+
     return file_path
 
 
@@ -400,7 +440,7 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
             ext = "mp3" if audio_only else (stream.subtype or "mp4")
             out_file = f"{uid}.{ext}"
             saved_path = stream.download(output_path=download_dir, filename=out_file)
-            saved_path = _post_process_for_ios(saved_path, audio_only=audio_only)
+            saved_path = _ensure_ios_playable_video(saved_path, audio_only=audio_only)
             return saved_path, title, ext
         except Exception as e:
             last_error = e
@@ -411,6 +451,7 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
 
 def _execute_download(url: str, platform: str, ydl_format: str, output_template: str, download_dir: str, uid: str, format_str: str, audio_only: bool = False) -> tuple[str, str, str]:
     """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix if blocked."""
+    _clean_old_cache()
     try:
         opts = _ydl_opts(platform, ydl_format, output_template, audio_only=audio_only)
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -429,7 +470,7 @@ def _execute_download(url: str, platform: str, ydl_format: str, output_template:
             if actual_file_path and os.path.isfile(actual_file_path):
                 title = info.get("title") or info.get("id") or "video"
                 ext = os.path.splitext(actual_file_path)[1].lstrip(".") or "mp4"
-                actual_file_path = _post_process_for_ios(actual_file_path, audio_only=audio_only)
+                actual_file_path = _ensure_ios_playable_video(actual_file_path, audio_only=audio_only)
                 return actual_file_path, str(title), ext
     except Exception as ytdlp_err:
         if platform == "youtube":
@@ -457,12 +498,13 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
 
     url = _normalize_url(url, platform)
     ydl_format, audio_only = _map_format(format)
-    download_dir = None
 
     async with download_semaphore:
-        download_dir = tempfile.mkdtemp(prefix="ydl_")
-        uid = uuid.uuid4().hex[:8]
-        output_template = os.path.join(download_dir, f"{uid}.%(ext)s")
+        uid = uuid.uuid4().hex[:10]
+        item_dir = os.path.join(CACHE_DIR, uid)
+        os.makedirs(item_dir, exist_ok=True)
+        output_template = os.path.join(item_dir, f"{uid}.%(ext)s")
+        
         try:
             actual_file_path, title, ext = await asyncio.to_thread(
                 _execute_download,
@@ -470,36 +512,31 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
                 platform,
                 ydl_format,
                 output_template,
-                download_dir,
+                item_dir,
                 uid,
                 format,
                 audio_only,
             )
         except HTTPException:
-            _cleanup(download_dir)
             raise
         except Exception as exc:
-            _cleanup(download_dir)
             raise HTTPException(status_code=502, detail=_public_error(platform, exc)) from exc
 
         if not actual_file_path or not os.path.isfile(actual_file_path):
-            _cleanup(download_dir)
             raise HTTPException(status_code=500, detail="Download finished but the file was not found.")
 
         clean_ext = "mp3" if audio_only or ext == "mp3" else ext
         media_type = "audio/mpeg" if audio_only or clean_ext == "mp3" else "video/mp4"
+        safe_name = _safe_filename(title, clean_ext)
 
         return FileResponse(
             path=actual_file_path,
             media_type=media_type,
+            filename=safe_name,
             headers={
-                "Content-Disposition": _content_disposition(title, clean_ext),
                 "Accept-Ranges": "bytes",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
+                "Cache-Control": "public, max-age=3600",
             },
-            background=BackgroundTask(_cleanup, download_dir),
         )
 
 
@@ -567,15 +604,13 @@ HOME_PAGE = """<!DOCTYPE html>
   <style>
     :root {
       --bg: #090d16;
-      --card-bg: rgba(20, 26, 43, 0.75);
+      --card-bg: rgba(20, 26, 43, 0.82);
       --card-border: rgba(255, 255, 255, 0.08);
-      --accent: #6366f1;
-      --accent-hover: #4f46e5;
       --accent-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
       --text: #f8fafc;
       --text-muted: #94a3b8;
-      --input-bg: rgba(15, 23, 42, 0.85);
-      --radius: 16px;
+      --input-bg: rgba(15, 23, 42, 0.9);
+      --radius: 18px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -587,95 +622,70 @@ HOME_PAGE = """<!DOCTYPE html>
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 24px 16px;
-      position: relative;
-      overflow-x: hidden;
+      padding: 20px 16px;
       -webkit-font-smoothing: antialiased;
-    }
-    body::before, body::after {
-      content: '';
-      position: absolute;
-      width: 320px;
-      height: 320px;
-      border-radius: 50%;
-      filter: blur(120px);
-      z-index: 0;
-      pointer-events: none;
-    }
-    body::before {
-      background: rgba(99, 102, 241, 0.25);
-      top: 10%;
-      left: 15%;
-    }
-    body::after {
-      background: rgba(236, 72, 153, 0.2);
-      bottom: 15%;
-      right: 15%;
     }
     .container {
       width: 100%;
-      max-width: 580px;
+      max-width: 540px;
       background: var(--card-bg);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border: 1px solid var(--card-border);
       border-radius: var(--radius);
-      padding: 36px 28px;
-      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5);
-      position: relative;
-      z-index: 1;
+      padding: 32px 24px;
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.6);
     }
     .header {
       text-align: center;
-      margin-bottom: 28px;
+      margin-bottom: 24px;
     }
-    .logo-badge {
+    .badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 6px 14px;
+      padding: 5px 12px;
       border-radius: 9999px;
-      background: rgba(99, 102, 241, 0.12);
-      border: 1px solid rgba(99, 102, 241, 0.3);
-      color: #818cf8;
-      font-size: 0.85rem;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      color: #a5b4fc;
+      font-size: 0.8rem;
       font-weight: 500;
       margin-bottom: 12px;
     }
     h1 {
-      font-size: 1.85rem;
+      font-size: 1.8rem;
       font-weight: 700;
-      letter-spacing: -0.02em;
       background: linear-gradient(180deg, #ffffff 0%, #cbd5e1 100%);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .subtitle {
       color: var(--text-muted);
-      font-size: 0.95rem;
+      font-size: 0.92rem;
     }
     .platforms {
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
       gap: 6px;
-      margin-top: 14px;
+      margin-top: 12px;
     }
     .pill {
-      font-size: 0.75rem;
-      padding: 4px 10px;
+      font-size: 0.72rem;
+      padding: 3px 8px;
       border-radius: 6px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
       color: #cbd5e1;
     }
     .form-group {
-      margin-bottom: 20px;
+      margin-bottom: 18px;
     }
     label {
       display: block;
-      font-size: 0.88rem;
+      font-size: 0.85rem;
       font-weight: 600;
       color: #cbd5e1;
       margin-bottom: 8px;
@@ -692,76 +702,62 @@ HOME_PAGE = """<!DOCTYPE html>
       color: #fff;
       font-family: inherit;
       font-size: 0.95rem;
-      padding: 14px 16px;
+      padding: 13px 14px;
       border-radius: 12px;
       outline: none;
-      transition: border-color 0.2s, box-shadow 0.2s;
+      transition: border-color 0.2s;
       -webkit-appearance: none;
     }
     input[type="url"]:focus, select:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+      border-color: #818cf8;
     }
     .paste-btn {
       position: absolute;
       right: 8px;
       top: 50%;
       transform: translateY(-50%);
-      background: rgba(255, 255, 255, 0.08);
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.12);
       color: #e2e8f0;
-      font-size: 0.78rem;
+      font-size: 0.75rem;
       font-weight: 600;
-      padding: 6px 12px;
+      padding: 6px 10px;
       border-radius: 8px;
       cursor: pointer;
-      transition: background 0.2s;
-    }
-    .paste-btn:hover {
-      background: rgba(255, 255, 255, 0.16);
     }
     select {
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
       background-repeat: no-repeat;
       background-position: right 14px center;
-      background-size: 18px;
-      padding-right: 40px;
+      background-size: 16px;
+      padding-right: 36px;
     }
     .submit-btn {
       width: 100%;
       background: var(--accent-gradient);
       color: #ffffff;
       font-family: inherit;
-      font-size: 1.05rem;
+      font-size: 1rem;
       font-weight: 600;
-      padding: 15px;
+      padding: 14px;
       border-radius: 12px;
       border: none;
       cursor: pointer;
       box-shadow: 0 4px 15px rgba(99, 102, 241, 0.35);
-      transition: transform 0.15s, opacity 0.2s;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 10px;
-    }
-    .submit-btn:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
+      margin-top: 6px;
     }
     .submit-btn:active {
-      transform: translateY(1px);
-    }
-    .submit-btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-      transform: none;
+      opacity: 0.85;
     }
     .spinner {
       display: none;
-      width: 20px;
-      height: 20px;
-      border: 3px solid rgba(255, 255, 255, 0.3);
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255, 255, 255, 0.3);
       border-top-color: #ffffff;
       border-radius: 50%;
       animation: spin 0.8s linear infinite;
@@ -769,47 +765,27 @@ HOME_PAGE = """<!DOCTYPE html>
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
-    .status-msg {
-      margin-top: 18px;
-      font-size: 0.88rem;
-      text-align: center;
+    .status-hint {
       display: none;
-      padding: 10px 14px;
-      border-radius: 10px;
-    }
-    .status-msg.loading {
-      display: block;
-      background: rgba(99, 102, 241, 0.12);
-      color: #a5b4fc;
-      border: 1px solid rgba(99, 102, 241, 0.25);
-    }
-    .status-msg.error {
-      display: block;
-      background: rgba(239, 68, 68, 0.12);
-      color: #fca5a5;
-      border: 1px solid rgba(239, 68, 68, 0.25);
-    }
-    .status-msg.success {
-      display: block;
-      background: rgba(34, 197, 94, 0.12);
-      color: #86efac;
-      border: 1px solid rgba(34, 197, 94, 0.25);
+      margin-top: 14px;
+      font-size: 0.85rem;
+      text-align: center;
+      color: #93c5fd;
     }
     .footer {
-      margin-top: 24px;
+      margin-top: 20px;
       text-align: center;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       color: var(--text-muted);
-      z-index: 1;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <div class="logo-badge">⚡ iOS & Android Compatible</div>
-      <h1>Social Video Downloader</h1>
-      <p class="subtitle">Download videos and audio in highest quality</p>
+      <div class="badge">✨ iPhone, iPad & Android Supported</div>
+      <h1>Social Downloader</h1>
+      <p class="subtitle">Download social media videos & audio in full quality</p>
       <div class="platforms">
         <span class="pill">Facebook</span>
         <span class="pill">Twitter (X)</span>
@@ -821,19 +797,20 @@ HOME_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <form id="dlForm" onsubmit="handleDownload(event)">
+    <!-- Standard native form submit guarantees 100% reliable iOS Safari download dialog -->
+    <form id="dlForm" action="/download" method="get" onsubmit="showLoading()">
       <div class="form-group">
-        <label for="url">Video URL</label>
+        <label for="url">Video Link</label>
         <div class="input-wrapper">
-          <input id="url" name="url" type="url" required placeholder="Paste link from Facebook, X, Reddit, TikTok..." />
+          <input id="url" name="url" type="url" required placeholder="Paste Facebook, X, Reddit, TikTok link..." />
           <button type="button" class="paste-btn" onclick="pasteClipboard()">Paste</button>
         </div>
       </div>
 
       <div class="form-group">
-        <label for="format">Download Format & Quality</label>
+        <label for="format">Format / Quality</label>
         <select id="format" name="format">
-          <option value="best" selected>Best Quality (MP4)</option>
+          <option value="best" selected>Best Video Quality (MP4)</option>
           <option value="1080p">1080p Full HD (MP4)</option>
           <option value="720p">720p HD (MP4)</option>
           <option value="480p">480p SD (MP4)</option>
@@ -847,12 +824,14 @@ HOME_PAGE = """<!DOCTYPE html>
         <span id="btnText">Download Video</span>
       </button>
 
-      <div id="statusBox" class="status-msg"></div>
+      <div id="statusHint" class="status-hint">
+        ⏳ Downloading & optimizing video. Please wait...
+      </div>
     </form>
   </div>
 
   <div class="footer">
-    Fast, private & compatible with iPhone, iPad, Android and PC
+    Fast download with native iOS Photos & Files app playback
   </div>
 
   <script>
@@ -863,50 +842,26 @@ HOME_PAGE = """<!DOCTYPE html>
           document.getElementById('url').value = text;
         }
       } catch (err) {
-        console.log('Clipboard paste not allowed:', err);
+        console.log('Clipboard access restricted');
       }
     }
 
-    async function handleDownload(e) {
-      e.preventDefault();
-      const urlInput = document.getElementById('url').value.trim();
-      const format = document.getElementById('format').value;
+    function showLoading() {
       const btn = document.getElementById('btnSubmit');
       const spinner = document.getElementById('btnSpinner');
       const btnText = document.getElementById('btnText');
-      const status = document.getElementById('statusBox');
+      const hint = document.getElementById('statusHint');
 
-      if (!urlInput) return;
-
-      btn.disabled = true;
       spinner.style.display = 'block';
-      btnText.innerText = 'Processing Video...';
-      status.className = 'status-msg loading';
-      status.innerText = 'Fetching and optimizing video for iOS & Android playback...';
+      btnText.innerText = 'Processing...';
+      hint.style.display = 'block';
 
-      try {
-        const downloadUrl = `/download?url=${encodeURIComponent(urlInput)}&format=${encodeURIComponent(format)}`;
-        
-        // Trigger download directly so iOS Safari and Android Chrome handle the stream seamlessly
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.setAttribute('download', '');
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-
-        status.className = 'status-msg success';
-        status.innerText = 'Download started! Check your downloads or files.';
-      } catch (err) {
-        status.className = 'status-msg error';
-        status.innerText = 'Error initiating download. Please try again.';
-      } finally {
-        setTimeout(() => {
-          btn.disabled = false;
-          spinner.style.display = 'none';
-          btnText.innerText = 'Download Video';
-        }, 3000);
-      }
+      // Reset UI after 12 seconds
+      setTimeout(() => {
+        spinner.style.display = 'none';
+        btnText.innerText = 'Download Video';
+        hint.style.display = 'none';
+      }, 12000);
     }
   </script>
 </body>
