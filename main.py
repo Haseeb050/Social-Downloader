@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -9,13 +8,13 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 
 load_dotenv()
@@ -126,18 +125,18 @@ def _is_http_url(url: str) -> bool:
 
 def _platform(url: str) -> str | None:
     host = _host(url)
+    if host in {"youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com"} or host.endswith(".youtube.com"):
+        return "youtube"
+    if host in {"instagram.com", "instagr.am"} or host.endswith(".instagram.com"):
+        return "instagram"
+    if host in {"tiktok.com", "vm.tiktok.com", "vt.tiktok.com"} or host.endswith(".tiktok.com"):
+        return "tiktok"
     if host in {"twitter.com", "x.com", "t.co"} or host.endswith(".twitter.com") or host.endswith(".x.com"):
         return "twitter"
     if host in {"facebook.com", "fb.watch", "fb.com", "m.facebook.com", "web.facebook.com"} or host.endswith(".facebook.com"):
         return "facebook"
     if host in {"reddit.com", "redd.it", "v.redd.it"} or host.endswith(".reddit.com"):
         return "reddit"
-    if host in {"instagram.com", "instagr.am"} or host.endswith(".instagram.com"):
-        return "instagram"
-    if host in {"tiktok.com", "vt.tiktok.com", "vm.tiktok.com"} or host.endswith(".tiktok.com"):
-        return "tiktok"
-    if host in {"youtube.com", "youtu.be"} or host.endswith(".youtube.com"):
-        return "youtube"
     if host in {"snapchat.com"} or host.endswith(".snapchat.com"):
         return "snapchat"
     if host in {"linkedin.com"} or host.endswith(".linkedin.com"):
@@ -149,58 +148,8 @@ def _platform(url: str) -> str | None:
     return None
 
 
-def _resolve_url(url: str) -> str:
-    """Follow HTTP redirects for short URLs."""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().removeprefix("www.")
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            final_url = resp.geturl()
-            if "login" not in final_url:
-                return final_url
-            query = parse_qs(urlparse(final_url).query)
-            if "next" in query and query["next"]:
-                target = unquote(query["next"][0])
-                if "facebook.com" in target and "login" not in target:
-                    return target
-    except urllib.error.HTTPError as e:
-        if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
-            loc = e.headers.get("Location")
-            if "login" not in loc:
-                return loc
-            query = parse_qs(urlparse(loc).query)
-            if "next" in query and query["next"]:
-                target = unquote(query["next"][0])
-                if "facebook.com" in target and "login" not in target:
-                    return target
-    except Exception:
-        pass
-
-    return url
-
-
 def _normalize_url(url: str, platform: str) -> str:
     parsed = urlparse(url)
-    if platform == "facebook":
-        clean_path = parsed.path.rstrip("/")
-        query_dict = parse_qs(parsed.query)
-        clean_params = {}
-        if "v" in query_dict:
-            clean_params["v"] = query_dict["v"]
-        new_query = urlencode(clean_params, doseq=True)
-        return f"https://www.facebook.com{clean_path}" + (f"?{new_query}" if new_query else "")
     if platform == "instagram":
         return f"https://www.instagram.com{parsed.path.rstrip('/')}/"
     if platform == "youtube":
@@ -220,9 +169,6 @@ def _normalize_url(url: str, platform: str) -> str:
     if platform == "reddit":
         clean_path = parsed.path.rstrip("/")
         return f"https://www.reddit.com{clean_path}"
-    if platform == "threads":
-        clean_path = parsed.path.rstrip("/")
-        return f"https://www.threads.net{clean_path}"
     return url
 
 
@@ -230,23 +176,14 @@ def _map_format(fmt: str) -> tuple[str, bool]:
     raw = (fmt or "best").strip().lower()
     audio_only = raw in {"mp3", "audio", "bestaudio", "wav", "ogg"}
     if audio_only:
-        return "bestaudio[ext=m4a]/bestaudio/best", True
+        return "bestaudio/best", True
     height = QUALITY_HEIGHT.get(raw)
     if height:
         return (
-            f"best[height<={height}][ext=mp4]/"
-            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={height}]+bestaudio/"
-            f"best[height<={height}]/best",
+            f"best[height<={height}]/bestvideo[height<={height}]+bestaudio/best/18/b",
             False,
         )
-    return (
-        "best[ext=mp4]/"
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/"
-        "best",
-        False,
-    )
+    return "best/bestvideo+bestaudio/18/b", False
 
 
 def _safe_filename(title: str, ext: str) -> str:
@@ -260,7 +197,6 @@ def _safe_filename(title: str, ext: str) -> str:
 
 def _public_error(platform: str, exc: Exception) -> str:
     text = str(exc).lower()
-    print(f"[{platform}] Download error: {exc}")
     if "unavailable" in text or "private" in text or "does not exist" in text:
         return f"This video is unavailable, deleted, or private on {platform.capitalize()}."
     if "sign in" in text or "not a bot" in text or "429" in text:
@@ -368,7 +304,7 @@ def _render_error_page(message: str, status_code: int = 502) -> HTMLResponse:
     return HTMLResponse(content=html_content, status_code=status_code)
 
 
-def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: bool = False) -> dict:
+def _ydl_opts(platform: str, ydl_format: str, output_template: str) -> dict:
     referers = {
         "youtube": "https://www.youtube.com/",
         "instagram": "https://www.instagram.com/",
@@ -381,11 +317,6 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
         "pinterest": "https://www.pinterest.com/",
         "threads": "https://www.threads.net/",
     }
-    user_agent = (
-        "facebookexternalhit/1.1 (+https://www.facebook.com/externalhit_uatext.php)"
-        if platform == "facebook"
-        else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
     opts = {
         "format": ydl_format,
         "outtmpl": output_template,
@@ -397,40 +328,16 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
         "retries": 3,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
         "http_headers": {
-            "User-Agent": user_agent,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
             "Referer": referers.get(platform, "https://www.google.com/"),
-            "Accept-Language": "en-US,en;q=0.9",
         },
         "js_runtimes": {
             "node": {"path": "node"},
         },
     }
-
-    if audio_only:
-        opts["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ]
-    else:
-        opts["postprocessors"] = [
-            {
-                "key": "FFmpegVideoRemuxer",
-                "preferedformat": "mp4",
-            }
-        ]
-        opts["postprocessor_args"] = {
-            "merger": [
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-            ],
-            "videoremuxer": [
-                "-movflags", "+faststart",
-            ],
-        }
 
     if platform == "youtube":
         opts["extractor_args"] = {
@@ -450,10 +357,7 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
 
 
 def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
-    """
-    Ensures video has H.264 video, AAC audio, yuv420p pixel format, and +faststart.
-    This guarantees 100% video and audio playback in iOS Photos app, Safari, QuickTime, and Android.
-    """
+    """Fast remux for iOS faststart moov atom."""
     if audio_only or not file_path.endswith(".mp4"):
         return file_path
 
@@ -463,31 +367,11 @@ def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
     try:
         cmd_remux = [
             ffmpeg_bin, "-y", "-i", file_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
+            "-c", "copy",
             "-movflags", "+faststart",
             temp_target,
         ]
         res = subprocess.run(cmd_remux, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        if res.returncode == 0 and os.path.isfile(temp_target) and os.path.getsize(temp_target) > 1000:
-            os.replace(temp_target, file_path)
-            return file_path
-    except Exception:
-        pass
-
-    try:
-        cmd_transcode = [
-            ffmpeg_bin, "-y", "-i", file_path,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "22",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            temp_target,
-        ]
-        res = subprocess.run(cmd_transcode, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
         if res.returncode == 0 and os.path.isfile(temp_target) and os.path.getsize(temp_target) > 1000:
             os.replace(temp_target, file_path)
             return file_path
@@ -501,65 +385,6 @@ def _ensure_ios_playable_video(file_path: str, audio_only: bool = False) -> str:
                 pass
 
     return file_path
-
-
-def _download_facebook_direct_fallback(url: str, download_dir: str, uid: str) -> tuple[str, str, str]:
-    """Fallback extractor for Facebook reels/videos using OpenGraph & playable CDN streams."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "facebookexternalhit/1.1 (+https://www.facebook.com/externalhit_uatext.php)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
-
-    # Match direct CDN video stream URLs from Facebook HTML
-    video_url = None
-    title = "Facebook Video"
-
-    # Match OpenGraph title
-    m_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
-    if m_title:
-        title = m_title.group(1).strip()
-
-    # Search for playable HD/SD streams
-    for pattern in [
-        r'"playable_url_quality_hd":"(https:[^"]+)"',
-        r'"playable_url":"(https:[^"]+)"',
-        r'<meta\s+property="og:video:secure_url"\s+content="([^"]+)"',
-        r'<meta\s+property="og:video"\s+content="([^"]+)"',
-        r'hd_src:"(https:[^"]+)"',
-        r'sd_src:"(https:[^"]+)"',
-    ]:
-        m = re.search(pattern, html)
-        if m:
-            raw_url = m.group(1).replace(r"\/", "/")
-            if "fbcdn.net" in raw_url or "facebook.com" in raw_url:
-                video_url = raw_url
-                break
-
-    if not video_url:
-        raise RuntimeError("No direct Facebook video stream found.")
-
-    out_file = os.path.join(download_dir, f"{uid}.mp4")
-    dl_req = urllib.request.Request(
-        video_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://www.facebook.com/",
-        }
-    )
-    with urllib.request.urlopen(dl_req, timeout=30) as src, open(out_file, "wb") as dst:
-        shutil.copyfileobj(src, dst)
-
-    if os.path.isfile(out_file) and os.path.getsize(out_file) > 1000:
-        out_file = _ensure_ios_playable_video(out_file, audio_only=False)
-        return out_file, title, "mp4"
-
-    raise RuntimeError("Facebook direct download failed.")
 
 
 def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: str) -> tuple[str, str, str]:
@@ -583,11 +408,7 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
             else:
                 height = QUALITY_HEIGHT.get(raw)
                 if height:
-                    stream = yt.streams.filter(progressive=True, res=f"{height}p", file_extension="mp4").first()
-                    if not stream:
-                        stream = yt.streams.filter(res=f"{height}p", file_extension="mp4").first()
-                if not stream:
-                    stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                    stream = yt.streams.filter(res=f"{height}p", file_extension="mp4").first()
                 if not stream:
                     stream = yt.streams.get_highest_resolution() or yt.streams.first()
 
@@ -607,11 +428,11 @@ def _download_with_pytubefix(url: str, format_str: str, download_dir: str, uid: 
     raise last_error or RuntimeError("Could not download video via pytubefix fallback.")
 
 
-def _execute_download(url: str, platform: str, ydl_format: str, output_template: str, download_dir: str, uid: str, format_str: str, audio_only: bool = False) -> tuple[str, str, str]:
-    """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix or direct CDN if blocked."""
+def _execute_download(url: str, platform: str, ydl_format: str, output_template: str, download_dir: str, uid: str, format_str: str) -> tuple[str, str, str]:
+    """Dual-engine pipeline: yt-dlp first, auto fallback to pytubefix if blocked."""
     _clean_old_cache()
     try:
-        opts = _ydl_opts(platform, ydl_format, output_template, audio_only=audio_only)
+        opts = _ydl_opts(platform, ydl_format, output_template)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
@@ -628,14 +449,9 @@ def _execute_download(url: str, platform: str, ydl_format: str, output_template:
             if actual_file_path and os.path.isfile(actual_file_path):
                 title = info.get("title") or info.get("id") or "video"
                 ext = os.path.splitext(actual_file_path)[1].lstrip(".") or "mp4"
-                actual_file_path = _ensure_ios_playable_video(actual_file_path, audio_only=audio_only)
+                actual_file_path = _ensure_ios_playable_video(actual_file_path, audio_only=False)
                 return actual_file_path, str(title), ext
     except Exception as ytdlp_err:
-        if platform == "facebook":
-            try:
-                return _download_facebook_direct_fallback(url, download_dir, uid)
-            except Exception:
-                raise ytdlp_err from None
         if platform == "youtube":
             try:
                 return _download_with_pytubefix(url, format_str, download_dir, uid)
@@ -659,7 +475,6 @@ async def download_video(
     if not _is_http_url(url):
         return _render_error_page("Invalid URL provided. Please provide a valid video link.", 400)
 
-    url = await asyncio.to_thread(_resolve_url, url)
     platform = _platform(url)
     if not platform:
         return _render_error_page("Unsupported platform. Supported: Facebook, Twitter/X, Reddit, Instagram, TikTok, YouTube, Pinterest, LinkedIn, Snapchat, Threads.", 400)
@@ -683,7 +498,6 @@ async def download_video(
                 item_dir,
                 uid,
                 format,
-                audio_only,
             )
         except Exception as exc:
             err_msg = _public_error(platform, exc)
@@ -717,7 +531,6 @@ async def get_media_info(url: str = Query(...)):
     if not _is_http_url(url):
         raise HTTPException(status_code=400, detail="url must be a valid http or https link.")
 
-    url = await asyncio.to_thread(_resolve_url, url)
     platform = _platform(url)
     if not platform:
         raise HTTPException(
@@ -734,8 +547,7 @@ async def get_media_info(url: str = Query(...)):
             "noplaylist": True,
             "skip_download": True,
             "http_headers": {
-                "User-Agent": "facebookexternalhit/1.1 (+https://www.facebook.com/externalhit_uatext.php)" if platform == "facebook" else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             },
         }
         cookie_file = _get_cookie_file()
@@ -760,32 +572,8 @@ async def get_media_info(url: str = Query(...)):
             "duration": info.get("duration"),
             "formats": ["best", "1080p", "720p", "480p", "360p", "mp3"],
         }
-    except Exception:
-        # Fallback to direct extraction for info
-        if platform == "facebook":
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": "facebookexternalhit/1.1 (+https://www.facebook.com/externalhit_uatext.php)",
-                        "Accept": "text/html",
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    h = r.read().decode("utf-8", errors="ignore")
-                m_t = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', h)
-                m_i = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', h)
-                return {
-                    "status": "success",
-                    "platform": "facebook",
-                    "title": m_t.group(1) if m_t else "Facebook Video",
-                    "thumbnail": m_i.group(1) if m_i else None,
-                    "duration": None,
-                    "formats": ["best", "1080p", "720p", "480p", "360p", "mp3"],
-                }
-            except Exception as fe:
-                raise HTTPException(status_code=502, detail=_public_error(platform, fe))
-        raise HTTPException(status_code=502, detail="Unable to extract video information.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=_public_error(platform, e))
 
 
 HOME_PAGE = """<!DOCTYPE html>
