@@ -12,9 +12,9 @@ from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 
 load_dotenv()
@@ -152,11 +152,16 @@ def _resolve_url(url: str) -> str:
     """Follow HTTP redirects for short URLs (Reddit, Snapchat, TikTok, LinkedIn, etc.)."""
     parsed = urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.")
+
+    # Facebook, Instagram & TikTok URLs should NOT be resolved with urllib because Meta/TikTok 302-redirects bot requests to /login!
+    if "facebook.com" in host or "fb.watch" in host or "fb.com" in host or "instagram.com" in host or "tiktok.com" in host:
+        return url
+
     needs_resolve = (
         "/s/" in parsed.path
         or "/share/" in parsed.path
         or "/t/" in parsed.path
-        or host in {"lnkd.in", "pin.it", "t.co", "vt.tiktok.com", "vm.tiktok.com", "fb.watch", "youtu.be", "redd.it"}
+        or host in {"lnkd.in", "pin.it", "t.co", "youtu.be", "redd.it"}
     )
     if not needs_resolve:
         return url
@@ -252,23 +257,107 @@ def _public_error(platform: str, exc: Exception) -> str:
     if "sign in" in text or "not a bot" in text or "429" in text:
         return f"{platform.capitalize()} rate-limited or blocked this request. Try again shortly."
     if "empty media" in text or "login" in text or "cookies" in text:
-        if platform == "instagram":
-            return "Instagram video unavailable. Ensure the post is public."
         if platform == "facebook":
             return "Facebook video unavailable. Ensure the post/reel is public."
+        if platform == "instagram":
+            return "Instagram video unavailable. Ensure the post is public."
         if platform == "snapchat":
             return "Snapchat video unavailable or expired. Ensure it is public."
         if platform == "linkedin":
             return "LinkedIn video unavailable. Ensure the post is public."
         if platform == "reddit":
             return "Reddit video unavailable or deleted."
-        return "This video requires authentication."
+        return "This video requires authentication or is private."
     if "ffmpeg" in text:
         return "ffmpeg is required to process this video."
     short = str(exc).split("\n")[0].strip()
     if len(short) > 220:
         short = short[:217] + "..."
     return short or "Download failed. The video may be private, geo-blocked, or unavailable."
+
+
+def _render_error_page(message: str, status_code: int = 502) -> HTMLResponse:
+    """Render a clean, user-friendly HTML error page instead of raw JSON."""
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Download Notice - FDownloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #090d16;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }}
+    .card {{
+      background: rgba(20, 26, 43, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      padding: 36px 28px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.7);
+    }}
+    .icon {{
+      width: 56px;
+      height: 56px;
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 20px;
+      font-size: 24px;
+      color: #ef4444;
+    }}
+    h1 {{
+      font-size: 1.4rem;
+      margin-bottom: 12px;
+      color: #ffffff;
+    }}
+    p {{
+      color: #94a3b8;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }}
+    .btn {{
+      display: inline-block;
+      background: linear-gradient(135deg, #16a34a, #22c55e);
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 12px 24px;
+      border-radius: 10px;
+      box-shadow: 0 4px 12px rgba(22, 163, 74, 0.3);
+      transition: opacity 0.2s;
+    }}
+    .btn:hover {{ opacity: 0.9; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">⚠️</div>
+    <h1>Download Notice</h1>
+    <p>{message}</p>
+    <a href="https://fdownloader.online" class="btn">← Back to FDownloader</a>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content, status_code=status_code)
 
 
 def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: bool = False) -> dict:
@@ -300,6 +389,7 @@ def _ydl_opts(platform: str, ydl_format: str, output_template: str, audio_only: 
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Referer": referers.get(platform, "https://www.google.com/"),
+            "Accept-Language": "en-US,en;q=0.9",
         },
         "js_runtimes": {
             "node": {"path": "node"},
@@ -484,18 +574,24 @@ def _execute_download(url: str, platform: str, ydl_format: str, output_template:
     raise RuntimeError("Downloaded file not found on disk.")
 
 
-@app.get("/download", dependencies=[Depends(_verify_api_key)])
-async def download_video(url: str = Query(...), format: str = Query("best")):
+@app.get("/download")
+async def download_video(
+    request: Request,
+    url: str = Query(...),
+    format: str = Query("best"),
+    api_key: str | None = Query(None),
+):
+    # API key check
+    if API_SECRET_KEY and api_key != API_SECRET_KEY and request.headers.get("X-API-Key") != API_SECRET_KEY:
+        return _render_error_page("Unauthorized request. Invalid API Key.", 401)
+
     if not _is_http_url(url):
-        raise HTTPException(status_code=400, detail="url must be a valid http or https link.")
+        return _render_error_page("Invalid URL provided. Please provide a valid video link.", 400)
 
     url = await asyncio.to_thread(_resolve_url, url)
     platform = _platform(url)
     if not platform:
-        raise HTTPException(
-            status_code=400,
-            detail="Platform not supported. Supported: Facebook, Twitter/X, Reddit, Instagram, TikTok, YouTube, Pinterest, LinkedIn, Snapchat, Threads.",
-        )
+        return _render_error_page("Unsupported platform. Supported: Facebook, Twitter/X, Reddit, Instagram, TikTok, YouTube, Pinterest, LinkedIn, Snapchat, Threads.", 400)
 
     url = _normalize_url(url, platform)
     ydl_format, audio_only = _map_format(format)
@@ -518,13 +614,12 @@ async def download_video(url: str = Query(...), format: str = Query("best")):
                 format,
                 audio_only,
             )
-        except HTTPException:
-            raise
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=_public_error(platform, exc)) from exc
+            err_msg = _public_error(platform, exc)
+            return _render_error_page(err_msg, 502)
 
         if not actual_file_path or not os.path.isfile(actual_file_path):
-            raise HTTPException(status_code=500, detail="Download finished but the file was not found.")
+            return _render_error_page("Download finished but the file was not found on server.", 500)
 
         clean_ext = "mp3" if audio_only or ext == "mp3" else ext
         media_type = "audio/mpeg" if audio_only or clean_ext == "mp3" else "video/mp4"
@@ -568,7 +663,8 @@ async def get_media_info(url: str = Query(...)):
             "noplaylist": True,
             "skip_download": True,
             "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
             },
         }
         cookie_file = _get_cookie_file()
